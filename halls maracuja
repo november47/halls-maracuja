@@ -1,0 +1,268 @@
+
+import os
+import datetime
+import sqlite3
+import secrets
+import string
+
+from zoneinfo import ZoneInfo
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN não foi configurado no arquivo .env")
+
+
+# CONFIGURAÇÃO DOS LEMBRETES
+
+TZ = ZoneInfo("America/Cuiaba")
+
+REMINDER_USER_IDS = [
+    int(x.strip())
+    for x in os.environ["REMINDER_USER_IDS"].split(",")
+]
+
+NOTIFY_CHANNEL_ID = int(os.environ["NOTIFY_CHANNEL_ID"])
+WILLIAN_CHANNEL_ID = int(os.environ["WILLIAN_CHANNEL_ID"])
+
+MSG_MANHA = "⏰ Bom dia! Hora de resgatar os pontos do Microsoft Rewards."
+MSG_TARDE = "⏰ Segunda chamada: já resgatou os pontos do Microsoft Rewards hoje?"
+
+
+# CONTAGEM REGRESSIVA DO WILLIAN
+
+DATA_RETORNO_WILLIAN = datetime.date(2026, 12, 16)
+
+
+# SISTEMA DE PROTOCOLOS DE TICKETS
+
+TICKETS_DB = "tickets.db"
+
+
+def inicializar_banco_tickets():
+    with sqlite3.connect(TICKETS_DB) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tickets (
+                codigo TEXT PRIMARY KEY,
+                criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                usuario_id INTEGER
+            )
+        """)
+
+
+def gerar_protocolo(usuario_id: int) -> str:
+    caracteres = string.ascii_uppercase + string.digits
+    ano = datetime.datetime.now(TZ).year
+
+    with sqlite3.connect(TICKETS_DB, timeout=10) as conn:
+        for tentativa in range(100):
+            aleatorio = "".join(
+                secrets.choice(caracteres) for _ in range(6)
+            )
+
+            codigo = f"TK-{ano}-{aleatorio}"
+
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO tickets (codigo, usuario_id)
+                VALUES (?, ?)
+                """,
+                (codigo, usuario_id)
+            )
+
+            if cursor.rowcount == 1:
+                return codigo
+
+    raise RuntimeError("Não foi possível gerar um protocolo exclusivo.")
+
+
+inicializar_banco_tickets()
+
+
+# CLASSE PRINCIPAL DO BOT
+
+class HallsBot(commands.Bot):
+
+    def __init__(self):
+        super().__init__(
+            command_prefix="!",
+            intents=discord.Intents.default()
+        )
+
+        self.avisou_online = False
+
+    async def setup_hook(self):
+        lembrete_manha.start()
+        lembrete_tarde.start()
+        contagem_willian.start()
+
+        synced = await self.tree.sync()
+
+        print(f"{len(synced)} comando(s) sincronizado(s)")
+
+
+bot = HallsBot()
+
+
+# ENVIO DE LEMBRETES
+
+async def enviar_lembrete(texto: str):
+    try:
+        channel = (
+            bot.get_channel(NOTIFY_CHANNEL_ID)
+            or await bot.fetch_channel(NOTIFY_CHANNEL_ID)
+        )
+
+        marcacoes = " ".join(
+            f"<@{uid}>" for uid in REMINDER_USER_IDS
+        )
+
+        await channel.send(f"{marcacoes} {texto}")
+
+    except Exception as e:
+        print(f"Falha ao enviar lembrete: {e}")
+
+
+# ENVIO EXCLUSIVO DO WILLIAN
+
+async def enviar_contagem_willian(texto: str):
+    try:
+        channel = (
+            bot.get_channel(WILLIAN_CHANNEL_ID)
+            or await bot.fetch_channel(WILLIAN_CHANNEL_ID)
+        )
+
+        await channel.send(texto)
+
+    except Exception as e:
+        print(f"Falha ao enviar contagem do Willian: {e}")
+
+
+# LEMBRETE DA MANHÃ
+
+@tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=TZ))
+async def lembrete_manha():
+    await enviar_lembrete(MSG_MANHA)
+
+
+# LEMBRETE DA TARDE
+
+@tasks.loop(time=datetime.time(hour=15, minute=45, tzinfo=TZ))
+async def lembrete_tarde():
+    await enviar_lembrete(MSG_TARDE)
+
+
+# CONTAGEM REGRESSIVA DO WILLIAN
+
+@tasks.loop(time=datetime.time(hour=14, minute=5, tzinfo=TZ))
+async def contagem_willian():
+    hoje = datetime.datetime.now(TZ).date()
+    dias = (DATA_RETORNO_WILLIAN - hoje).days
+
+    if dias > 1:
+        mensagem = (
+            f"🏖️ Faltam **{dias} dias** para o Willian voltar de férias!"
+        )
+
+    elif dias == 1:
+        mensagem = "⏰ **AMANHÃ O WILLIAN VOLTA DE FÉRIAS!**"
+
+    elif dias == 0:
+        mensagem = "🚨 **O WILLIAN VOLTOU DE FÉRIAS! ACABOU A PAZ!**"
+
+    else:
+        return
+
+    await enviar_contagem_willian(mensagem)
+
+
+# ESPERAR O BOT FICAR ONLINE
+
+@lembrete_manha.before_loop
+@lembrete_tarde.before_loop
+@contagem_willian.before_loop
+async def esperar_bot():
+    await bot.wait_until_ready()
+
+
+# AVISO DE INICIALIZAÇÃO
+
+@bot.event
+async def on_ready():
+    print(f"Bot conectado como {bot.user}")
+
+    if bot.avisou_online:
+        return
+
+    bot.avisou_online = True
+
+    try:
+        channel = (
+            bot.get_channel(NOTIFY_CHANNEL_ID)
+            or await bot.fetch_channel(NOTIFY_CHANNEL_ID)
+        )
+
+        agora = datetime.datetime.now(TZ).strftime("%d/%m/%Y %H:%M:%S")
+
+        await channel.send(
+            f"Bot operante! Horário: {agora}"
+        )
+
+    except Exception as e:
+        print(f"Falha ao deixar o bot online: {e}")
+
+
+# TRATAMENTO DE ERROS DOS COMANDOS
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError
+):
+    print(f"Erro no comando: {error}")
+
+    mensagem = "Deu ruim, tenta de novo."
+
+    if not interaction.response.is_done():
+        await interaction.response.send_message(
+            mensagem,
+            ephemeral=True
+        )
+
+
+# COMANDO DE TICKETS
+
+@bot.tree.command(
+    name="ticket",
+    description="Gera um protocolo único para ticket interno"
+)
+async def ticket(interaction: discord.Interaction):
+    try:
+        codigo = gerar_protocolo(interaction.user.id)
+
+        await interaction.response.send_message(
+            f"🎫 **Novo protocolo gerado!**\n"
+            f"```{codigo}```\n"
+            f"Solicitado por: {interaction.user.mention}",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print(f"Erro ao gerar protocolo: {e}")
+
+        await interaction.response.send_message(
+            "Não foi possível gerar o protocolo. Tente novamente.",
+            ephemeral=True
+        )
+
+
+# INICIALIZAÇÃO
+
+bot.run(TOKEN)
